@@ -4,5 +4,5 @@ project(filesys C)
 set(CMAKE_C_STANDARD 11)
 
 add_executable(filesys
-        dfclient/dfclient.c
-        dfserver/dfserver.c)
+        client/dfclient.c
+        server/dfserver.c)
