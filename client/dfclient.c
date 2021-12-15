@@ -24,20 +24,6 @@
 #define SERVER_NUM 4
 
 
-#define FILE_TABLE int filePartTable [4][4][2] = {\
-            {\
-                    {0,1},{1,2},{2,3},{3,0}\
-            },\
-            {\
-                    {3,0},{0,1},{1,2},{2,3}\
-            },\
-            {\
-                    {2,3},{3,0},{0,1},{1,2}\
-            },\
-            {\
-                    {1,2},{2,3},{3,0},{0,1}\
-            }   \
-    }
 /* server values read from the config file */
 typedef struct ServerVals {
     char *ip[SERVER_NUM];
@@ -57,20 +43,17 @@ void error(char *msg) {
 
 ServerVals *readConfigVals(FILE *config);
 
-int executeGET(char *fileName, int sockfd[]);
-
-int executePUT(char *fileName, int sockfd[]);
-
-int executeLIST(int sockfd[]);
 
 int allocatePartSize(int partSize, int fileSizeIndicator, char **serverPart);
+
+unsigned long getHashRowVal(int serverIndex, int *cMask, int partCalcSize, char **serverPart, size_t partSize,
+                            const unsigned char *outBuf, MD5_CTX *md5Ctx, unsigned char *hash, const FILE *fileToPut);
 
 int main(int argc, char **argv) {
 
     FILE *config;
 
-    char username[BUFSIZE], password[BUFSIZE];
-    char userInputBuf[256], ack[5];
+    char userInputBuf[256];
 
     char *filepath = NULL;
     /* check command line arguments */
@@ -83,7 +66,7 @@ int main(int argc, char **argv) {
 
     config = fopen(filepath, "rb");
     if (!config)
-        error("Config file not opened\n");
+        error("ERROR Config file not opened.\n");
 
     //setting up the server and user info ///
     struct timeval timeout;
@@ -108,12 +91,12 @@ int main(int argc, char **argv) {
         if (setsockopt(sockfd[serverIndex], SOL_SOCKET, SO_RCVTIMEO, (char *) &timeout,
                        sizeof(timeout)) < 0) {
             char *errMsg = calloc(100, sizeof(char));
-            snprintf(errMsg, 100, "Socket setting options failed for Server %d.", serverIndex);
+            snprintf(errMsg, 100, "ERROR Socket setting options failed for Server %d.", serverIndex);
             error(errMsg);
         }
         if (connect(sockfd[serverIndex], (struct sockaddr *) &serveraddr[serverIndex],
                     sizeof(serveraddr[serverIndex])) < 0) {
-            error("Connecting to the server failed.");
+            error("ERROR Connecting to the server failed.");
         }
     }
 
@@ -148,16 +131,132 @@ int main(int argc, char **argv) {
         /* check for file */
         if (strcmp(command, "get") == 0) {
             printf("get <%s>\n", fileName);
-            if (executeGET(fileName, sockfd) < 0)
-                error("ERROR in GET.");
+
+            char partBuffer[BUFSIZE];
+            char allParts[SERVER_NUM][BUFSIZE];
+
+            long partLen;
+            int partCount[SERVER_NUM];
+
+            for (int partIndex = 0; partIndex < SERVER_NUM; partIndex++) {
+                readBytes = read(sockfd[partIndex], &partCount[partIndex], sizeof(partCount[partIndex]));
+                if (readBytes < 0) {
+                    error("ERROR reading size message.");
+                }
+            }
+
+            for (int serverIndex = 0; serverIndex < SERVER_NUM; serverIndex++) {
+                for (int partIndex = 0; partIndex < partCount[serverIndex]; partIndex++) {
+                    char messageChar;
+
+                    readBytes = read(sockfd[serverIndex], &messageChar, sizeof(char));
+                    if (readBytes < 0)
+                        error("ERROR in getting message char.");
+
+                    readBytes = read(sockfd[serverIndex], (char *) partLen, sizeof(partLen));
+                    if (readBytes < 0)
+                        error("ERROR in getting part len.\n");
+
+                    readBytes = read(sockfd[serverIndex], partBuffer, partLen);
+                    if (readBytes < 0)
+                        error("ERROR in getting the file.\n");
+
+                    int serverPartIndicator = messageChar - '0';
+                    if (serverPartIndicator == 1)
+                        strcpy(allParts[0], partBuffer);
+                    if (serverPartIndicator == 2)
+                        strcpy(allParts[1], partBuffer);
+                    if (serverPartIndicator == 3)
+                        strcpy(allParts[2], partBuffer);
+                    if (serverPartIndicator == 4)
+                        strcpy(allParts[3], partBuffer);
+                    bzero(partBuffer, sizeof(partBuffer));
+                    partLen = 0;
+                }
+            }
+
+            /* save file */
+            FILE* fileToSave = fopen(fileName, "wb");
+            if (fileToSave == NULL) {
+                error("ERROR in saving the file to client.");
+            }
+            for (int partIndex = 0; partIndex < SERVER_NUM; partIndex++) {
+                fprintf(fileToSave, "%c", partBuffer[partIndex]);
+            }
+            continue;
+
         } else if (strcmp(command, "put") == 0) {
             printf("put <%s>\n", fileName);
-            if (executePUT(fileName, sockfd) < 0)
-                error("ERROR in PUT.");
+            int filePartTable[4][4][2] =
+                 { {{0, 1},{1, 2},{2, 3},{3, 0}},
+                 { {3, 0},{0, 1},{1, 2},{2, 3} },
+                 { {2, 3},{3, 0},{0, 1},{1, 2} },
+                 { {1, 2},{2, 3},{3, 0},{0, 1} } };
+            int fileSizeIndicator = 0, serverIndex = 0,
+                    cMask = 0, partCalcSize = 0;
+            long fileSize;
+            char *serverPart[SERVER_NUM];
+            size_t partSize = 0;
+            unsigned char outBuf[MD5_DIGEST_LENGTH];
+            MD5_CTX md5Ctx;
+            unsigned char *hash;
+            unsigned long hashRow = 0;
+
+            FILE *fileToPut = fopen(fileName, "r+b");
+            if (fileToPut == NULL) {
+                error("ERROR put couldn't open file.");
+            }
+
+            /* find file size
+             * Resource:
+             * https://stackoverflow.com/questions/238603/how-can-i-get-a-files-size-in-c
+             * */
+            fseek(fileToPut, 0L, SEEK_END);
+            fileSize = ftell(fileToPut);
+            rewind(fileToPut);
+
+            /* find part size,
+             * if even or odd */
+            partCalcSize = fileSize / 4;
+            int res = fileSize % 2;
+            if (res != 0) {
+                fileSizeIndicator = 1;
+            }
+
+            /* allocate memory for each part */
+            if (allocatePartSize(partCalcSize, fileSizeIndicator, serverPart) < 0) {
+                error("ERROR allocating mem for parts");
+            }
+            hashRow = getHashRowVal(serverIndex,
+                                    &cMask, partCalcSize,
+                                    serverPart, partSize,
+                                    outBuf, &md5Ctx, hash, fileToPut);
+            char writeChar;
+            int theExtraByte = 0, messageLen, partToBeSent;
+            for (int key = 0; key < SERVER_NUM; key++) {
+                for (int val = 0; val < 2; val++) {
+                    if (filePartTable[hashRow][key][val] == 3 && fileSizeIndicator) {
+                        theExtraByte = 1;
+                    }
+                    messageLen = strlen(serverPart[filePartTable[hashRow][key][val]]);
+                    messageLen = htonl(messageLen);
+                    partToBeSent = (filePartTable[hashRow][key][val]);
+                    if (write(sockfd[key], &partToBeSent, sizeof(partToBeSent)) < 0) {
+                        error("ERROR sending part number");
+                    }
+                    if (write(sockfd[key], &messageLen, sizeof(messageLen)) < 0) {
+                        error("ERROR sending len part of message");
+                    }
+                    if (write(sockfd[key], serverPart[filePartTable[hashRow][key][val]],
+                              strlen(serverPart[filePartTable[hashRow][key][val]])) < 0) {
+                        error("ERROR sending the part file.");
+                    }
+                }
+            }
+            continue;
         } else if (strcmp(command, "list") == 0) {
-            printf("list\n");
-            if (executeLIST(sockfd) < 0)
-                error("ERROR in LIST.");
+            printf("list is not implemented at the moment\n");
+            continue;
         } else {
             /*handle wrong command */
             printf("Invalid command provided %s\n", command);
@@ -165,7 +264,6 @@ int main(int argc, char **argv) {
         }
     }
 }
-
 ServerVals *readConfigVals(FILE *config) {
     ServerVals *serverVals = malloc(sizeof(ServerVals));
     char fileBuffer[BUFSIZE];
@@ -205,72 +303,38 @@ ServerVals *readConfigVals(FILE *config) {
     return serverVals;
 }
 
-int executeGET(char *fileName, int sockfd[]) {
-    return 0;
-}
-
-int executePUT(char *fileName, int sockfd[]) {
-    int fileSizeIndicator = 0, serverIndex = 0,
-        cMask = 0, partCalcSize = 0;
-    long fileSize;
-    char *serverPart[SERVER_NUM];
-    size_t partSize = 0;
-    unsigned char outBuf[MD5_DIGEST_LENGTH];
-    MD5_CTX md5Ctx;
-    unsigned char *hash;
-    unsigned long hashRow = 0;
-
-    FILE *fileToPut = fopen(fileName, "r+b");
-    if (fileToPut == NULL) {
-        error("ERROR put couldn't open file.");
-    }
-
-    /* find file size
-     * Resource:
-     * https://stackoverflow.com/questions/238603/how-can-i-get-a-files-size-in-c
-     * */
-    fseek(fileToPut, 0L, SEEK_END);
-    fileSize = ftell(fileToPut);
-    rewind(fileToPut);
-
-    /* find part size,
-     * if even or odd */
-    partCalcSize = fileSize / 4;
-    int res = fileSize % 2;
-    if (res != 0) {
-        fileSizeIndicator = 1;
-    }
-
-    /* allocate memory for each part */
-    if(allocatePartSize(partCalcSize, fileSizeIndicator, serverPart) < 0){
-        error("ERROR allocating mem for parts");
-    }
-
-    /* preform MD5 hashing
-     * Resources:
-     * https://www.openssl.org/docs/man1.1.1/man3/MD5.html
-     * https://stackoverflow.com/questions/7627723/how-to-create-a-md5-hash-of-a-string-in-c
-     * https://stackoverflow.com/questions/10324611/how-to-calculate-the-md5-hash-of-a-large-file-in-c
-     * */
-    MD5_Init(&md5Ctx);
-    while((cMask = fgetc(fileToPut)) != EOF){
-        serverPart[serverIndex][partSize++]= (char) cMask;
-        MD5_Update(&md5Ctx, &cMask, 1);
-        if(serverIndex < SERVER_NUM - 1){
-            if(partSize >= partCalcSize){
+/* preform MD5 hashing
+   * Resources:
+   * https://www.openssl.org/docs/man1.1.1/man3/MD5.html
+   * https://stackoverflow.com/questions/7627723/how-to-create-a-md5-hash-of-a-string-in-c
+   * https://stackoverflow.com/questions/10324611/how-to-calculate-the-md5-hash-of-a-large-file-in-c
+   * */
+unsigned long getHashRowVal(int serverIndex, int *cMask, int partCalcSize, char **serverPart, size_t partSize,
+                            const unsigned char *outBuf, MD5_CTX *md5Ctx, unsigned char *hash, const FILE *fileToPut) {
+    unsigned long hashRow;
+    MD5_Init(md5Ctx);
+    while (((*cMask) = fgetc(fileToPut)) != EOF) {
+        serverPart[serverIndex][partSize++] = (char) (*cMask);
+        MD5_Update(md5Ctx, cMask, 1);
+        if (serverIndex < SERVER_NUM - 1) {
+            if (partSize >= partCalcSize) {
                 serverIndex++;
                 partSize = 0;
             }
         }
     }
-    MD5_Final(outBuf, &md5Ctx);
+    MD5_Final(outBuf, md5Ctx);
     char temp[SERVER_NUM];
-    hash = calloc(sizeof (MD5_DIGEST_LENGTH), sizeof (char ));
-    for(int index = 0; index < MD5_DIGECT_LENGTH;index++){
+    hash = calloc(sizeof(MD5_DIGEST_LENGTH), sizeof(char));
+    for (int index = 0; index < MD5_DIGEST_LENGTH; index++) {
         sprintf(temp, "%02x", (unsigned int) outBuf[index]);
         strcat(hash, temp);
     }
-    return 0;
+    char first_five[5];
+    strncpy(first_five, hash, 5);
+    /*Find the mod result */
+    hashRow = (long) strtol(first_five, NULL, 16) % 4;
+    return hashRow;
 }
 
 int allocatePartSize(int partCalcSize, int fileSizeIndicator, char **serverPart) {
@@ -283,11 +347,5 @@ int allocatePartSize(int partCalcSize, int fileSizeIndicator, char **serverPart)
     }
     return 0;
 }
-
-int executeLIST(int sockfd[]) {
-    return 0;
-
-}
-
 
 #pragma clang diagnostic pop

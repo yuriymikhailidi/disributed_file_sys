@@ -1,3 +1,4 @@
+CC = gcc
 SERVER_DIR := server
 CLIENT_DIR := client
 BIN_DIR := .
@@ -8,20 +9,20 @@ CLIENT_SRC := $(wildcard $(CLIENT_DIR)/*.c)
 SERVER_OBJ := $(SERVER_SRC: $(SERVER_DIR)/%.c = $(SERVER_DIR)/%.o)
 CLIENT_OBJ := $(CLIENT_SRC: $(CLIENT_DIR)/%.c = $(CLIENT_DIR)/%.o)
 
-CPPFLAGS := -Iinclude -MMD -MP
+CPPFLAGS := -I/usr/local/opt/openssl@3/include -Iinclude -MMD -MP
 CFLAGS := -g -Wall
 LDLIBS := -lm
-LDFLAGS := -Llib
+LDFLAGS := -L/usr/local/opt/openssl@3/lib
 
 all: $(SERVER_EXE)  $(CLIENT_EXE)
 
 .PHONY: all clean
 
 $(SERVER_EXE) : $(SERVER_OBJ) | $(BIN_DIR)
-	$(CC) $^ $(LDLIBS) -o $@
+	$(CC) $^ -o $@
 
 $(CLIENT_EXE) : $(CLIENT_OBJ) | $(BIN_DIR)
-	$(CC) $^ $(LDLIBS) -o $@
+	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@ -lcrypto
 
 $(SERVER_OBJ)/%.o: $(SERVER_SRC)/%.c | $(SERVER_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@
