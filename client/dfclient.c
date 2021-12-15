@@ -11,6 +11,7 @@
 #include <netdb.h>
 #include <errno.h>
 #include <arpa/inet.h>
+#include <openssl/md5.h>
 
 #pragma clang diagnostic push
 #pragma ide diagnostic ignored "EndlessLoop"
@@ -23,6 +24,20 @@
 #define SERVER_NUM 4
 
 
+#define FILE_TABLE int filePartTable [4][4][2] = {\
+            {\
+                    {0,1},{1,2},{2,3},{3,0}\
+            },\
+            {\
+                    {3,0},{0,1},{1,2},{2,3}\
+            },\
+            {\
+                    {2,3},{3,0},{0,1},{1,2}\
+            },\
+            {\
+                    {1,2},{2,3},{3,0},{0,1}\
+            }   \
+    }
 /* server values read from the config file */
 typedef struct ServerVals {
     char *ip[SERVER_NUM];
@@ -41,14 +56,21 @@ void error(char *msg) {
 }
 
 ServerVals *readConfigVals(FILE *config);
-int userValidation(int sockfd[], int sockArrSize,  ServerVals* serverVals);
+
+int executeGET(char *fileName, int sockfd[]);
+
+int executePUT(char *fileName, int sockfd[]);
+
+int executeLIST(int sockfd[]);
+
+int allocatePartSize(int partSize, int fileSizeIndicator, char **serverPart);
 
 int main(int argc, char **argv) {
 
     FILE *config;
 
     char username[BUFSIZE], password[BUFSIZE];
-    char userInputBuf[256];
+    char userInputBuf[256], ack[5];
 
     char *filepath = NULL;
     /* check command line arguments */
@@ -58,8 +80,6 @@ int main(int argc, char **argv) {
     }
     filepath = argv[1];
 
-    char inputBuf[BUFSIZE];
-    char command[BUFSIZE], fileName[BUFSIZE];
 
     config = fopen(filepath, "rb");
     if (!config)
@@ -73,12 +93,10 @@ int main(int argc, char **argv) {
     struct sockaddr_in serveraddr[4];
     int sockfd[4]; /* socket */
     int portno; /* port to listen on */
-
     ServerVals *serverVals;
     serverVals = readConfigVals(config);
-    int serverIndex = 0;
     /*Create necessary connection for client-server*/
-    while (serverIndex < SERVER_NUM) {
+    for (int serverIndex = 0; serverIndex < SERVER_NUM; serverIndex++) {
         bzero((char *) &serveraddr[serverIndex], sizeof(serveraddr[serverIndex]));
         portno = atoi(serverVals->port[serverIndex]);
         serveraddr[serverIndex].sin_family = AF_INET;
@@ -89,7 +107,7 @@ int main(int argc, char **argv) {
             error("ERROR opening socket.");
         if (setsockopt(sockfd[serverIndex], SOL_SOCKET, SO_RCVTIMEO, (char *) &timeout,
                        sizeof(timeout)) < 0) {
-            char* errMsg = calloc(100, sizeof (char ));
+            char *errMsg = calloc(100, sizeof(char));
             snprintf(errMsg, 100, "Socket setting options failed for Server %d.", serverIndex);
             error(errMsg);
         }
@@ -97,88 +115,57 @@ int main(int argc, char **argv) {
                     sizeof(serveraddr[serverIndex])) < 0) {
             error("Connecting to the server failed.");
         }
-        serverIndex++;
-
     }
 
     printf("client set up complete\n");
     fclose(config);
-    ///////////////////////////////////
-    /* user authentication */
-    if(userValidation(sockfd, SERVER_NUM, serverVals) < 0){
-        error("ERROR user/password in conf is invalid.");
-    }
-    /////////////////////////////////`
-
+    int readBytes = 0, writeBytes = 0;
+    char inputBuf[BUFSIZE];
+    char command[BUFSIZE], fileName[BUFSIZE];
     while (1) {
-        bzero(inputBuf, BUFSIZE);
-        bzero(command, BUFSIZE);
-        bzero(fileName, BUFSIZE);
-        printf("Enter get <filename>, put <filename>, "
-               "list or exit:");
+        memset(inputBuf, 0, strlen(inputBuf));
+        memset(command, 0, strlen(command));
+        memset(fileName, 0, strlen(fileName));
+        printf("Enter get <filename>, put <filename>, list: ");
         fgets(inputBuf, BUFSIZE, stdin);
         sscanf(inputBuf, "%s %s", command, fileName);
-
-        /* check if exit */
-        if (strcmp(command, "exit") == 0) {
-            printf("Exiting...\n");
-            exit(0);
+        strtok(inputBuf, "\n");
+        sprintf(userInputBuf, "%s %s %s", inputBuf, serverVals->username, serverVals->password);
+        int userLen = htonl(strlen(userInputBuf));
+        printf("Client sent: %s\n", userInputBuf);
+        for (int serverIndex = 0; serverIndex < SERVER_NUM; serverIndex++) {
+            printf("Writing to Server %s\n", serverVals->serverDir[serverIndex]);
+            writeBytes = write(sockfd[serverIndex], (char *) &userLen, sizeof(userLen));
+            if (writeBytes < 0) {
+                error("ERROR failed write user buff len.");
+            }
+            writeBytes = write(sockfd[serverIndex], userInputBuf, strlen(userInputBuf));
+            if (writeBytes < 0) {
+                error("ERROR failed write user buff.");
+            }
+            printf("Client wrote %d bytes\n", writeBytes);
         }
         /* check for file */
-        if (strlen(fileName) > 0) {
-
-            if (strcmp(command, "get") == 0) {
-                printf("get <%s>\n", fileName);
-                sprintf(userInputBuf, "%s %s", command, fileName);
-                int userLen = htonl(strlen(userInputBuf));
-                serverIndex = 0;
-                while(serverIndex < SERVER_NUM){
-                    if(write(sockfd[serverIndex], (char*) &userLen, sizeof (userLen)) < 0){
-                        error("ERROR failed write user buff len.");
-                    }
-                    if(write(sockfd[serverIndex], userInputBuf, strlen(userInputBuf)) < 0){
-                        error("ERROR failed write user buff.");
-                    }
-                    serverIndex++;
-                }
-                continue;
-            }
-            if (strcmp(command, "put") == 0) {
-                printf("put <%s>\n", fileName);
-                continue;
-
-            } else {
-                /*handle wrong command */
-                printf("Invalid command: %s\n", command);
-                continue;
-            }
+        if (strcmp(command, "get") == 0) {
+            printf("get <%s>\n", fileName);
+            if (executeGET(fileName, sockfd) < 0)
+                error("ERROR in GET.");
+        } else if (strcmp(command, "put") == 0) {
+            printf("put <%s>\n", fileName);
+            if (executePUT(fileName, sockfd) < 0)
+                error("ERROR in PUT.");
         } else if (strcmp(command, "list") == 0) {
-            /*list */
             printf("list\n");
-            continue;
+            if (executeLIST(sockfd) < 0)
+                error("ERROR in LIST.");
         } else {
-            /* handle file missing */
-            printf("usage. get <filename>, put <filename>, list, and exit.\n");
+            /*handle wrong command */
+            printf("Invalid command provided %s\n", command);
             continue;
         }
     }
 }
-int userValidation(int sockfd[], int sockArrSize,  ServerVals* serverVals){
-    char userBuf[256];
-    sprintf(userBuf, "%s %s", serverVals->username, serverVals->password);
-    int userLen = htonl(strlen(userBuf));
-    int serverIndex = 0;
-    while(serverIndex < SERVER_NUM){
-        if(write(sockfd[serverIndex], (char*) &userLen, sizeof (userLen)) < 0){
-            error("ERROR failed write user buff len.");
-        }
-        if(write(sockfd[serverIndex], userBuf, strlen(userBuf)) < 0){
-            error("ERROR failed write user buff.");
-        }
-        serverIndex++;
-    }
-    return 0;
-}
+
 ServerVals *readConfigVals(FILE *config) {
     ServerVals *serverVals = malloc(sizeof(ServerVals));
     char fileBuffer[BUFSIZE];
@@ -217,5 +204,87 @@ ServerVals *readConfigVals(FILE *config) {
     }
     return serverVals;
 }
+
+int executeGET(char *fileName, int sockfd[]) {
+    return 0;
+}
+
+int executePUT(char *fileName, int sockfd[]) {
+    int fileSizeIndicator = 0, serverIndex = 0,
+        cMask = 0, partCalcSize = 0;
+    long fileSize;
+    char *serverPart[SERVER_NUM];
+    size_t partSize = 0;
+    unsigned char outBuf[MD5_DIGEST_LENGTH];
+    MD5_CTX md5Ctx;
+    unsigned char *hash;
+    unsigned long hashRow = 0;
+
+    FILE *fileToPut = fopen(fileName, "r+b");
+    if (fileToPut == NULL) {
+        error("ERROR put couldn't open file.");
+    }
+
+    /* find file size
+     * Resource:
+     * https://stackoverflow.com/questions/238603/how-can-i-get-a-files-size-in-c
+     * */
+    fseek(fileToPut, 0L, SEEK_END);
+    fileSize = ftell(fileToPut);
+    rewind(fileToPut);
+
+    /* find part size,
+     * if even or odd */
+    partCalcSize = fileSize / 4;
+    int res = fileSize % 2;
+    if (res != 0) {
+        fileSizeIndicator = 1;
+    }
+
+    /* allocate memory for each part */
+    if(allocatePartSize(partCalcSize, fileSizeIndicator, serverPart) < 0){
+        error("ERROR allocating mem for parts");
+    }
+
+    /* preform MD5 hashing
+     * Resources:
+     * https://www.openssl.org/docs/man1.1.1/man3/MD5.html
+     * https://stackoverflow.com/questions/7627723/how-to-create-a-md5-hash-of-a-string-in-c
+     * https://stackoverflow.com/questions/10324611/how-to-calculate-the-md5-hash-of-a-large-file-in-c
+     * */
+    MD5_Init(&md5Ctx);
+    while((cMask = fgetc(fileToPut)) != EOF){
+        serverPart[serverIndex][partSize++]= (char) cMask;
+        MD5_Update(&md5Ctx, &cMask, 1);
+        if(serverIndex < SERVER_NUM - 1){
+            if(partSize >= partCalcSize){
+                serverIndex++;
+                partSize = 0;
+            }
+        }
+    }
+    MD5_Final(outBuf, &md5Ctx);
+    char temp[SERVER_NUM];
+    hash = calloc(sizeof (MD5_DIGEST_LENGTH), sizeof (char ));
+
+    return 0;
+}
+
+int allocatePartSize(int partCalcSize, int fileSizeIndicator, char **serverPart) {
+    for (int serverIndex = 0; serverIndex < SERVER_NUM; serverIndex++) {
+        if (fileSizeIndicator && serverIndex == 3) {
+            serverPart[serverIndex] = calloc(sizeof(partCalcSize) + 1, sizeof(char));
+        } else {
+            serverPart[serverIndex] = calloc(sizeof(partCalcSize), sizeof(char));
+        }
+    }
+    return 0;
+}
+
+int executeLIST(int sockfd[]) {
+    return 0;
+
+}
+
 
 #pragma clang diagnostic pop

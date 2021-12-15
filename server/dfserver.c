@@ -7,12 +7,14 @@
 #include <string.h>
 #include <netdb.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <pthread.h>
+
 
 #pragma clang diagnostic push
 #pragma ide diagnostic ignored "EndlessLoop"
@@ -21,10 +23,14 @@
 #define USR_ARR_LEN 10
 #define PASS_ARR_LEN 10
 #define SRVR_NAME_LEN 20
-#define SRVR_PORT_LEN 20
-#define USR_NAME_LEN 100
-#define USR_PASS_LEN 100
+#define SRVR_PORT_LEN 25
+#define USR_NAME_LEN 25
+#define USR_PASS_LEN 25
 #define USR_VAL_FAIL -1
+#define CMND_LIST_LEN 4
+#define CMND_GET_LEN 3
+#define CMND_PUT_LEN 3
+
 /*
  * error - wrapper for perror
  */
@@ -48,14 +54,53 @@ struct ServerConfig {
 /* request handler */
 int processRequest(int);
 
+static void *create_thread(void *vargp) {
+    int connfd = *((int *) vargp);
+    pthread_detach(pthread_self());
+    free(vargp);
+    processRequest(connfd);
+    close(connfd);
+    return NULL;
+}
+int openListenfd(int port)
+{
+    int listenfd, optval=1;
+    struct sockaddr_in serveraddr;
+
+    /* Create a socket descriptor */
+    if ((listenfd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
+        return -1;
+
+    /* Eliminates "Address already in use" error from bind. */
+    if (setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR,
+                   (const void *)&optval , sizeof(int)) < 0)
+        return -1;
+
+    /* listenfd will be an endpoint for all requests to port
+       on any IP address for this host */
+    bzero((char *) &serveraddr, sizeof(serveraddr));
+    serveraddr.sin_family = AF_INET;
+    serveraddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    serveraddr.sin_port = htons((unsigned short)port);
+    if (bind(listenfd, (struct sockaddr*)&serveraddr, sizeof(serveraddr)) < 0)
+        return -1;
+
+    /* Make it a listening socket ready to accept connection requests */
+    if (listen(listenfd, LISTENQ) < 0)
+        return -1;
+    return listenfd;
+} /* end open_listenfd */
+
 int main(int argc, char **argv) {
-    int sockfd, connfd; /* socket */
+    int sockfd, connfd, *connfdp; /* socket */
     socklen_t clientlen; /* byte size of client's address */
     struct sockaddr_in serveraddr; /* server's addr */
     struct sockaddr_in clientaddr; /* client addr */
-    char confFileName[] = "dfs.conf"; /* server conf */
+    char confFileName[] = "./server/dfs.conf"; /* server conf */
     FILE *config;
     pid_t pid;
+    pthread_t tid;
+
 
     if (argc != 3) {
         printf("usage: <serverName> <portNumber>\n");
@@ -79,130 +124,104 @@ int main(int argc, char **argv) {
         count++;
     }
 
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd < 0)
-        error("ERROR opening socket.");
-
-    /* setsockopt: Handy debugging trick that lets
-     * us rerun the server immediately after we kill it;
-     * otherwise we have to wait about 20 secs.
-     * Eliminates "ERROR on binding: Address already in use" error.
-     */
-    int optval = 1;
-    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR,
-                   (const void *) &optval, sizeof(int)) < 0)
-        return -1;
-
-    /*
-     * build the server's Internet address
-     */
-    bzero((char *) &serveraddr, sizeof(serveraddr));
-    serveraddr.sin_family = AF_INET;
-    serveraddr.sin_addr.s_addr = htonl(INADDR_ANY);
-    serveraddr.sin_port = htons(atoi(ServerConfig.portNumber));
-
-    if (bind(sockfd, (struct sockaddr *) &serveraddr,
-             sizeof(serveraddr)) < 0) {
-        error("ERROR on binding.");
+    int listenfd = openListenfd(atoi(ServerConfig.portNumber));
+    while (1) {
+        connfdp = (int *) (malloc(sizeof(int)));
+        *connfdp = accept(listenfd, (struct sockaddr *) &clientaddr, (socklen_t *) &clientlen);
+        pthread_create(&tid, NULL, create_thread, connfdp);
     }
-
-    if (listen(sockfd, LISTENQ) < 0)
-        error("ERROR on listen for socket.");
-
-    /* Resources used to come up with request loop.
-     * https://stackoverflow.com/questions/33508997/waitpid-wnohang-wuntraced-how-do-i-use-these/34845669
-     * https://canvas.colorado.edu/courses/76700/files/36338717?module_item_id=3158491
-     */
-    printf("Server <%s> ready for connection.\n", ServerConfig.serverName);
-    while(1){
-        if((connfd = accept(sockfd, (struct sockaddr* ) &clientaddr, &clientlen)) < 0){
-            error("ERROR on accept from client sock.");
-        }
-        /* fork new process */
-        pid = fork();
-        if(pid == 0){
-            /* close socket connection */
-            if(close(sockfd) < 0)
-                error("ERROR closing the client sock.");
-            /* process the request on TCP connection */
-            if(processRequest(connfd) < 0)
-                error("ERROR processing the request.");
-            /* close connection after request handle */
-            if(close(connfd) <0)
-                error("ERROR closing the client connection.");
-            exit(0);
-        }
-        /* close connection if the fork failed */
-        close(connfd);
-        waitpid(-1, NULL, WNOHANG);
-    }
-
 }
-int processRequest(int connfd){
+int processRequest(int connfd) {
     /* User Validation Before ACK commands */
-    char command[BUFSIZE], fileName[BUFSIZE];
-    int readBytes, WriteBytes;
+    printf("Server %s waiting for input.\n", ServerConfig.serverName);
 
-    char buf[BUFSIZE];
+    int readBytes, writeBytes;
     int size = 0, indicator = 0;
+
+    char buf[BUFSIZE], bufCopy[BUFSIZE];
     char username[USR_NAME_LEN];
     char password[USR_PASS_LEN];
+    char command[BUFSIZE];
+    char fileName[BUFSIZE];
+    char CmndListException[CMND_LIST_LEN];
+
+    memset(buf, 0, strlen(buf));
+    memset(command, 0, strlen(command));
+    memset(fileName, 0, strlen(fileName));
+
     /* read user info */
-    if(read(connfd, (char *) &size, sizeof (size)) < 0){
+    readBytes = read(connfd, (char *) &size, sizeof(size));
+    if (readBytes < 0) {
         error("ERROR reading size message.");
     }
     size = ntohl(size);
-    if(read(connfd, buf, size) < 0){
+    readBytes = read(connfd, buf, size);
+    if (readBytes < 0) {
         error("ERROR reading user info.");
     }
-    printf("Server %s received: <%s>.\n", ServerConfig.serverName, buf);
-    /* parse the buff input */
-    if(sscanf(buf, "%s %s", username, password) < 0){
-        error("ERROR scanning buf for usr/pass.");
+
+    memcpy(bufCopy, buf, size);
+    printf("Server %s received: %s. Len: %d\n",
+           ServerConfig.serverName, bufCopy, size);
+    strncpy(CmndListException, bufCopy, CMND_LIST_LEN);
+    if (strcmp(CmndListException, "list") == 0) {
+        sscanf(bufCopy,"%s %s %s", command, username, password);
+    } else {
+        sscanf(bufCopy,"%s %s %s %s", command, fileName, username, password);
     }
     /* validate user */
-    for(int index = 0; index < USR_ARR_LEN; index++){
-        if(UserConfig.usr[index] == NULL){
+    for (int index = 0; index < USR_ARR_LEN; index++) {
+        if (UserConfig.usr[index] == NULL) {
             break;
-        }if((strcmp(UserConfig.usr[index], username) == 0) &&
-           (strcmp(UserConfig.pass[index], password) == 0)){
+        }
+        if ((strcmp(UserConfig.usr[index], username) == 0) &&
+            (strcmp(UserConfig.pass[index], password) == 0)) {
             indicator = 1;
             break;
         } else {
             continue;
         }
     }
-    if(!indicator){
+    if (!indicator) {
         printf("Server %s User: <%s> is not validated.\n", ServerConfig.serverName, username);
         return USR_VAL_FAIL;
     }
-    bzero(buf, BUFSIZE);
-    size = 0;
-    if(read(connfd, (char *) &size, sizeof (size)) < 0){
-        error("ERROR reading size message.");
+    /* create dir for the user
+     * Resource:
+     * https://stackoverflow.com/questions/10147990/how-to-create-directory-with-right-permissions-using-c-on-posix
+     * https://stackoverflow.com/questions/7430248/creating-a-new-directory-in-c
+     * */
+    struct stat dirStats = {0};
+    char dirServer[30];
+    char dirUser[30];
+
+    sprintf(dirServer, "./server/%s", ServerConfig.serverName);
+    int resServ = stat(dirServer, &dirStats);
+    if(resServ < 0) {
+        mkdir(dirServer, 0777);
     }
-    size = ntohl(size);
-    if(read(connfd, buf, size) < 0){
-        error("ERROR reading user info.");
+    sprintf(dirUser, "./server/%s/%s", ServerConfig.serverName, username);
+    int resUsr = stat(dirUser, &dirStats);
+    if(resUsr < 0) {
+        mkdir(dirUser, 0777);
+        printf("Server %s created user dir: %s\n", ServerConfig.serverName, dirUser);
     }
-    printf("Server %s received: <%s>.\n", ServerConfig.serverName, buf);
-
-//    if (strcmp(command, "get") == 0) {
-//        printf("Get: %s\n", fileName);
-//    }
-//    if (strcmp(command, "put") == 0) {
-//        printf("Put: %s\n", fileName);
-//    }
-//    if (strcmp(command, "list") == 0) {
-//        printf("List\n");
-//
-//    } else {
-//        printf("Invalid command: %s\n", command);
-//    }
-
-
+    /* ----------------------- */
+    if (strcmp(command, "get") == 0) {
+        /* ACK the input */
+        return 0;
+    }
+    if (strcmp(command, "put") == 0) {
+        /* ACK the input */
+        return 0;
+    }
+    if (strcmp(command, "list") == 0) {
+        /* ACK the input */
+        return 0;
+    } else {
+        return 0;
+    }
     return 0;
-
 }
 
 #pragma clang diagnostic pop
