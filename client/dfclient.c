@@ -266,7 +266,10 @@ int executePUT(char *fileName, int sockfd[]) {
     MD5_Final(outBuf, &md5Ctx);
     char temp[SERVER_NUM];
     hash = calloc(sizeof (MD5_DIGEST_LENGTH), sizeof (char ));
-
+    for(int index = 0; index < MD5_DIGECT_LENGTH;index++){
+        sprintf(temp, "%02x", (unsigned int) outBuf[index]);
+        strcat(hash, temp);
+    }
     return 0;
 }
 
